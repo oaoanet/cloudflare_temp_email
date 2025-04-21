@@ -30,40 +30,101 @@ jobs:
           version: 8
           run_install: false
 
+      # 添加缓存步骤提高构建速度
+      - name: Setup pnpm cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.pnpm-store
+            **/node_modules
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
       - name: Deploy Backend for ${{ github.ref_name }}
         run: |
-          export use_worker_assets=${{ secrets.USE_WORKER_ASSETS }}
+          # 设置环境变量
+          export use_worker_assets="${{ secrets.USE_WORKER_ASSETS }}"
+          export debug_mode="${{ secrets.DEBUG_MODE }}"
+          export use_mail_wasm_parser="${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}"
+          
+          # 调试信息
+          echo "Node version: $(node -v)"
+          echo "PNPM version: $(pnpm -v)"
+          echo "Working directory: $(pwd)"
+          echo "Directory structure:"
+          ls -la
+          
+          # 构建前端资产(如果需要)
           if [ -n "$use_worker_assets" ]; then
-            cd frontend/
-            pnpm install --no-frozen-lockfile
-            pnpm build:pages
-            cd ..
-          fi
-
-          export debug_mode=${{ secrets.DEBUG_MODE }}
-          export use_mail_wasm_parser=${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
-          cd worker/
-          echo '${{ secrets.BACKEND_TOML }}' > wrangler.toml
-          pnpm install --no-frozen-lockfile
-
-          if [ -n "$use_mail_wasm_parser" ]; then
-            echo "Using mail-parser-wasm-worker"
-            pnpm add mail-parser-wasm-worker
-            git apply ../.github/config/mail-parser-wasm-worker.patch
-            echo "Applied mail-parser-wasm-worker patch"
-          fi
-
-          if [ -n "$debug_mode" ]; then
-            pnpm run deploy
-          else
-            output=$(pnpm run deploy 2>&1)
-            if [ $? -ne 0 ]; then
-                code=$?
-                echo "Command failed with exit code $code"
-                exit $code
+            echo "Building frontend assets..."
+            if [ -d "frontend/" ]; then
+              cd frontend/
+              pnpm install
+              pnpm build:pages
+              cd ..
+              echo "Frontend build completed"
+            else
+              echo "Error: frontend directory not found"
+              exit 1
             fi
           fi
-          echo "Deployed for tag ${{ github.ref_name }}"
+
+          # 检查worker目录
+          if [ ! -d "worker/" ]; then
+            echo "Error: worker directory not found"
+            ls -la
+            exit 1
+          fi
+          
+          # 部署Worker
+          cd worker/
+          
+          # 生成wrangler.toml并验证
+          echo '${{ secrets.BACKEND_TOML }}' > wrangler.toml
+          if [ ! -s wrangler.toml ]; then
+            echo "Error: wrangler.toml is empty or not created correctly"
+            exit 1
+          fi
+          echo "wrangler.toml created successfully"
+          
+          # 安装依赖
+          echo "Installing worker dependencies..."
+          pnpm install
+          
+          # 添加mail-parser依赖(如果需要)
+          if [ -n "$use_mail_wasm_parser" ]; then
+            echo "Adding mail-parser-wasm-worker..."
+            pnpm add mail-parser-wasm-worker
+            
+            # 检查patch是否存在
+            if [ -f "../.github/config/mail-parser-wasm-worker.patch" ]; then
+              git apply ../.github/config/mail-parser-wasm-worker.patch
+              echo "Applied mail-parser-wasm-worker patch"
+            else
+              echo "Error: mail-parser patch file not found"
+              ls -la ../.github/config/
+              exit 1
+            fi
+          fi
+          
+          # 部署处理
+          if [ -n "$debug_mode" ]; then
+            echo "Deploying in debug mode..."
+            pnpm run deploy --verbose
+          else
+            echo "Deploying in standard mode..."
+            pnpm run deploy 2>&1 | tee deploy.log
+            if [ ${PIPESTATUS[0]} -ne 0 ]; then
+              echo "Deployment failed. Check deploy.log for details"
+              cat deploy.log
+              exit ${PIPESTATUS[0]}
+            fi
+          fi
+          
+          echo "Deployment completed successfully for tag ${{ github.ref_name }}"
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # 添加NODE_OPTIONS以避免内存问题
+          NODE_OPTIONS: "--max-old-space-size=4096"
